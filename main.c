@@ -9,9 +9,10 @@
 /* Ім'я вхідного файлу */
 const char *input_file_MA = "matrix.txt";
 const char *input_file_b = "b.txt";
+const char* output_file_x = "out_vector_x";
 
 /* Тег повідомленя, що містить стовпець матриці */
-const int COLUMN_TAG = 0x1;
+//const int COLUMN_TAG = 0x1;
 
 /* Основна функція (програма обчислення визначника) */
 int main(int argc, char *argv[])
@@ -25,183 +26,147 @@ int main(int argc, char *argv[])
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
 
     /* Зчитування даних в задачі 0 */
-    struct my_matrix *MA;
-    int N;
+    struct my_matrix *input_matrix;
+    int matrix_size;
     if(rank == 0)
     {
-        MA = read_matrix(input_file_MA);
+        input_matrix = read_matrix(input_file_MA);
 
-        if(MA->rows != MA->cols) {
+        if(input_matrix->rows != input_matrix->cols) {
             fatal_error("Matrix is not square!", 4);
         }
-        N = MA->rows;
+        matrix_size = input_matrix->rows;
     }
 
+
     /* Розсилка всім задачам розмірності матриць та векторів */
-    MPI_Bcast(&N, 1, MPI_INT, 0, MPI_COMM_WORLD);
+    MPI_Bcast(&matrix_size, 1, MPI_INT, 0, MPI_COMM_WORLD);
 
-    /* Обчислення кількості стовпців, які будуть зберігатися в кожній задачі та
-     * виділення пам'яті для їх зберігання */
-    int part = N / np;
-    struct my_matrix *MAh = matrix_alloc(N, part, .0);
+    /*Рассылка всем задачам вектора свободных членов.*/
+    struct my_vector* b = vector_alloc(matrix_size, 0.);
+    if(rank == 0){
+        b = read_vector(input_file_b);
+    }
+    MPI_Bcast(
+            b->data, matrix_size, MPI_DOUBLE, 0, MPI_COMM_WORLD
+    );
 
-    /* Створення та реєстрація типу даних для стовпця елементів матриці */
-    MPI_Datatype matrix_columns;
-    MPI_Type_vector(N*part, 1, np, MPI_DOUBLE, &matrix_columns);
-    MPI_Type_commit(&matrix_columns);
+    /* Выделяем память для строк в локальной памяти процессов. */
+    struct my_vector *local_row = vector_alloc(matrix_size, .0);
+    struct my_vector* local_l = vector_alloc(matrix_size, 0.);
+    struct my_vector* temp_row = vector_alloc(matrix_size, 0.);
 
-    /* Створення та реєстрація типу даних для структури вектора */
-    MPI_Datatype vector_struct;
-    MPI_Aint extent;
-    MPI_Type_extent(MPI_INT, &extent);            // визначення розміру в байтах
-    MPI_Aint offsets[] = {0, extent};
-    int lengths[] = {1, N+1};
-    MPI_Datatype oldtypes[] = {MPI_INT, MPI_DOUBLE};
-    MPI_Type_struct(2, lengths, offsets, oldtypes, &vector_struct);
-    MPI_Type_commit(&vector_struct);
-
-    /* Розсилка стовпців матриці з задачі 0 в інші задачі */
+    /* Розсилка рядків матриці з задачі 0 в інші задачі */
     if(rank == 0)
     {
-        for(int i = 1; i < np; i++)
-        {
-            MPI_Send(&(MA->data[i]), 1, matrix_columns, i, COLUMN_TAG, MPI_COMM_WORLD);
-        }
-        /* Копіювання елементів стовпців даної задачі */
-        for(int i = 0; i < part; i++)
-        {
-            int col_index = i*np;
-            for(int j = 0; j < N; j++)
-            {
-                MAh->data[j*part + i] = MA->data[j*N + col_index];
-            }
-        }
-        //free(MA);
+        MPI_Scatter(
+                input_matrix->data, matrix_size, MPI_DOUBLE,
+                local_row->data, matrix_size, MPI_DOUBLE,
+                0, MPI_COMM_WORLD
+        );
+
+        free(input_matrix);
     }
     else
     {
-        MPI_Recv(MAh->data, N*part, MPI_DOUBLE, 0, COLUMN_TAG, MPI_COMM_WORLD,
-                 MPI_STATUS_IGNORE);
+        MPI_Scatter(
+                NULL, 0, MPI_DATATYPE_NULL,
+                local_row->data, matrix_size, MPI_DOUBLE,
+                0, MPI_COMM_WORLD
+        );
     }
 
-    /* Поточне значення вектору l_i */
-    struct my_vector *current_l = vector_alloc(N, .0);
-    /* Частина стовпців матриці L */
-    struct my_matrix *MLh = matrix_alloc(N, part, .0);
-
-    /* Основний цикл ітерації (кроки) */
-    for(int step = 0; step < N-1; step++)
-    {
-        /* Вибір задачі, що містить стовпець з ведучім елементом та обчислення
-         * поточних значень вектору l_i */
-        if(step % np == rank)
-        {
-            int col_index = (step - (step % np)) / np;
-            MLh->data[step*part + col_index] = 1.;
-            for(int i = step+1; i < N; i++)
-            {
-                MLh->data[i*part + col_index] = MAh->data[i*part + col_index] /
-                                                MAh->data[step*part + col_index];
+    int current_leader = 0;
+    while (current_leader < matrix_size){
+        if (current_leader == rank){
+            for (int i = 0; i < matrix_size; i++){
+                temp_row->data[i] = local_row->data[i];
             }
-            for(int i = 0; i < N; i++)
-            {
-                current_l->data[i] = MLh->data[i*part + col_index];
+
+//                for (int i = 0; i < matrix_size; i++){
+//                    printf("%f\t", temp_row->data[i]);
+//                }
+//                printf("\n");
+
+        }
+
+        MPI_Bcast(
+                temp_row->data, matrix_size, MPI_DOUBLE, current_leader, MPI_COMM_WORLD
+        );
+
+        if(rank > current_leader){
+            local_l->data[current_leader] = local_row->data[current_leader] / temp_row->data[current_leader];
+            for (int j = 0; j < matrix_size; j++){
+                local_row->data[j] -= local_l->data[current_leader] * temp_row->data[j];
             }
         }
-        /* Розсилка поточних значень l_i */
-        MPI_Bcast(current_l, 1, vector_struct, step % np, MPI_COMM_WORLD);
-
-        /* Модифікація стовпців матриці МА відповідно до поточного l_i */
-        for(int i = step+1; i < N; i++)
-        {
-            for(int j = 0; j < part; j++)
-            {
-                MAh->data[i*part + j] -= MAh->data[step*part + j] * current_l->data[i];
-            }
-        }
+        current_leader++;
     }
 
+    ///////////////////////////////////////////////////////////////////////////////////////////////////////////
 
-    if (rank == 0){
-        for(int row = 0; row < N; row++){
-            for(int column = 0; column < part; column++){
-                MA->data[row * N + column] = MAh->data[row * part + column];
-            }
-        }
-
-        for(int i = 1; i < np; i++)
-        {
-            MPI_Recv(MAh->data, N * part, MPI_DOUBLE, i, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-            //printf("Received!\n");
-            /* Копіювання елементів стовпців даної задачі */
-            for(int row = 0; row < N; row++){
-                for(int column = 0; column < part; column++){
-                    double t = MAh->data[row * part + column];
-                    MA->data[row * N + column + i * part] = t;
-                }
-            }
-        }
-
-        FILE* f = fopen("out_matrix_a", "wt");
-        matrix_print(f, MA);
-        fclose(f);
-
-        //*****************************************************************************************************
-        struct my_matrix *ML = matrix_alloc(N, N, 0.0);
-        for(int row = 0; row < N; row++){
-            for(int column = 0; column < part; column++){
-                ML->data[row * N + column] = MLh->data[row * part + column];
-            }
-        }
-
-        for(int i = 1; i < np; i++)
-        {
-            MPI_Recv(MLh->data, N * part, MPI_DOUBLE, i, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-            //printf("Received!\n");
-            /* Копіювання елементів стовпців даної задачі */
-            for(int row = 0; row < N; row++){
-                for(int column = 0; column < part; column++){
-                    double t = MLh->data[row * part + column];
-                    ML->data[row * N + column + i * part] = t;
-                }
-            }
-        }
-        ML->data[N * N - 1] = 1.0;
-
-        f = fopen("out_matrix_l", "wt");
-        matrix_print(f, ML);
-        fclose(f);
-        //******************************************************************************************************
-
-        struct my_vector *y = read_vector(input_file_b);
-        struct my_vector *x = vector_alloc(N, 0.0);
-        for (int i = 0; i < N; i++){
-            for (int s = 0; s < i; s++){
-                y->data[i] -= y->data[s] * ML->data[i * N + s];
-            }
-        }
-
-        for (int i = N - 1; i >= 0; i --){
-            x->data[i] = y->data[i];
-
-            for (int s = i + 1; s < N; s++){
-                x->data[i] -= x->data[s] * MA->data[i * N + s];
-            }
-
-            x->data[i] /= MA->data[i * N + i];
-            f = fopen("out_vector_x", "wt");
-            vector_print(f, x);
-            fclose(f);
-        }
-
+    struct my_matrix* global_l;
+    if(rank == 0){
+        global_l = matrix_alloc(matrix_size, matrix_size, 0.);
+        MPI_Gather(
+                local_l->data, matrix_size, MPI_DOUBLE,
+                global_l->data, matrix_size, MPI_DOUBLE,
+                0, MPI_COMM_WORLD
+        );
     }else{
-        MPI_Send( MAh->data, N * part, MPI_DOUBLE, 0, 0, MPI_COMM_WORLD);
-        MPI_Send(MLh->data, N * part, MPI_DOUBLE, 0, 0, MPI_COMM_WORLD);
+        MPI_Gather(
+                local_l->data, matrix_size, MPI_DOUBLE,
+                NULL, 0, MPI_DOUBLE,
+                0, MPI_COMM_WORLD
+        );
     }
+
+    struct my_matrix* global_matrix;
+    if(rank == 0){
+        global_matrix = matrix_alloc(matrix_size, matrix_size, 0.);
+        MPI_Gather(
+                local_row->data, matrix_size, MPI_DOUBLE,
+                global_matrix->data, matrix_size, MPI_DOUBLE,
+                0, MPI_COMM_WORLD
+        );
+    }else{
+        MPI_Gather(
+                local_row->data, matrix_size, MPI_DOUBLE,
+                NULL, 0, MPI_DOUBLE,
+                0, MPI_COMM_WORLD
+        );
+    }
+
+//    if(rank == 0){
+//        for (int i = 0; i < matrix_size; i++){
+//            for (int j = 0; j < matrix_size; j++){
+//                printf("%f\t", global_matrix->data[i * matrix_size + j]);
+//            }
+//            printf("\n");
+//        }
+//    }
+
+    if(rank == 0) {
+        struct my_vector *y = vector_alloc(matrix_size, 0.);
+        for (int i = 0; i < matrix_size; i++){
+            y->data[i] = b->data[i];
+            for(int s = 0; s < i; s++){
+                y->data[i] -= y->data[s] * global_l->data[i * matrix_size + s];
+            }
+        }
+        struct my_vector* x = vector_alloc(matrix_size, 0.);
+        for(int i = matrix_size - 1; i >= 0; i--){
+            x->data[i] = y->data[i];
+            for (int s = i + 1; s < matrix_size; s++){
+                x->data[i] -= x->data[s] * global_matrix->data[i * matrix_size + s];
+            }
+            x->data[i] /= global_matrix->data[i * matrix_size + i];
+        }
+        write_vector(output_file_x, x);
+    }
+
 
     /* Повернення виділених ресурсів */
-    MPI_Type_free(&matrix_columns);
-    MPI_Type_free(&vector_struct);
     return MPI_Finalize();
 }
 
